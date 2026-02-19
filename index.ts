@@ -235,6 +235,18 @@ const SYNONYMS: Record<string, string[]> = {
   glucometer: ["glucose meter"],
   spo2: ["oximeter"],
   "sleep apnea": ["sleep apnea"],
+  oct: ["optical coherence tomography"],
+  pet: ["positron emission tomography"],
+  eeg: ["electroencephalograph"],
+  emg: ["electromyograph"],
+  "heart failure": ["ejection fraction"],
+  segmentation: ["contouring"],
+  arrhythmia: ["arrhythmia"],
+  afib: ["atrial fibrillation"],
+  "a-fib": ["atrial fibrillation"],
+  glaucoma: ["glaucoma"],
+  retinopathy: ["retinopathy"],
+  "macular degeneration": ["macular degeneration"],
   mammography: ["mammograph"],
   mammogram: ["mammograph"],
   polyp: ["lesion"],
@@ -325,17 +337,22 @@ function getCombinationIndices(n: number, size: number): number[][] {
 
 // Score how relevant results are to the original query terms.
 // Returns 0-1 where 1 = all original terms "covered" in device names/definitions.
-// A term is "covered" if either the term itself or any of its synonym expansions appear.
+// A term is "covered" if either the term itself appears, or ALL words of a synonym expansion appear.
 function scoreResults(results: Record<string, unknown>[], originalTerms: string[]): number {
   if (!results.length || !originalTerms.length) return 0;
 
-  // Build a coverage map: for each original term, what strings count as a match?
-  const coverageMap: { original: string; matchStrings: string[] }[] = originalTerms.map((t) => {
+  // Build a coverage map: for each original term, what match patterns count?
+  // Each pattern is either a single word (must appear) or a multi-word phrase (ALL words must appear).
+  const coverageMap: { original: string; patterns: string[][] }[] = originalTerms.map((t) => {
     const lower = t.toLowerCase();
-    const expansions = SYNONYMS[lower]
-      ? SYNONYMS[lower].flatMap((s) => s.toLowerCase().split(/\s+/))
-      : [];
-    return { original: lower, matchStrings: [lower, ...expansions] };
+    const patterns: string[][] = [[lower]]; // the literal term itself (single word)
+    if (SYNONYMS[lower]) {
+      for (const syn of SYNONYMS[lower]) {
+        const words = syn.toLowerCase().split(/\s+/);
+        patterns.push(words); // multi-word: ALL must match
+      }
+    }
+    return { original: lower, patterns };
   });
 
   let totalScore = 0;
@@ -344,8 +361,10 @@ function scoreResults(results: Record<string, unknown>[], originalTerms: string[
     const def = ((r.definition as string) ?? "").toLowerCase();
     const text = `${name} ${def}`;
     let covered = 0;
-    for (const { matchStrings } of coverageMap) {
-      if (matchStrings.some((s) => text.includes(s))) covered++;
+    for (const { patterns } of coverageMap) {
+      // A term is covered if ANY pattern matches (where multi-word patterns require ALL words)
+      const isCovered = patterns.some((words) => words.every((w) => text.includes(w)));
+      if (isCovered) covered++;
     }
     totalScore += covered / coverageMap.length;
   }
@@ -398,6 +417,19 @@ server.tool(
       query = undefined;
     }
 
+    // Auto-detect K-number or PMA number passed as query — redirect with helpful message
+    if (!product_code && query) {
+      const trimmed = query.trim();
+      if (K_NUMBER_RE.test(trimmed)) {
+        return { content: [{ type: "text" as const, text: `"${trimmed}" is a 510(k) number. Use \`search_510k\` with \`k_number: "${trimmed.toUpperCase()}"\` to look it up, or use \`classify_device\` with a device name query.` }] };
+      }
+      if (PMA_NUMBER_RE.test(trimmed)) {
+        return { content: [{ type: "text" as const, text: `"${trimmed}" is a PMA number. Use \`search_pma\` with \`pma_number: "${trimmed.toUpperCase()}"\` to look it up, or use \`classify_device\` with a device name query.` }] };
+      }
+      // Strip special characters that break openFDA search (periods, slashes, etc.)
+      query = query.replace(/[.\/\\@#$%^&*(){}[\]|<>~`]/g, " ").replace(/\s+/g, " ").trim();
+    }
+
     // Direct product code lookup
     if (product_code) {
       const err = validateProductCode(product_code);
@@ -437,8 +469,9 @@ server.tool(
     // Filler words that add noise to FDA classification searches
     const FILLER_WORDS = new Set([
       "a", "an", "the", "for", "of", "in", "on", "to", "and", "or", "is", "it",
-      "what", "how", "which", "my", "with", "from", "that", "this",
-      "fda", "class", "device", "medical", "need", "does",
+      "what", "how", "which", "my", "with", "from", "that", "this", "are", "can",
+      "fda", "class", "device", "medical", "need", "does", "use", "used",
+      "health", "care", "system", "product", "new", "based", "using",
     ]);
 
     const MAX_API_CALLS = 30; // Cap total API calls to avoid rate limits
@@ -455,7 +488,8 @@ server.tool(
       const fullLength = allCombos.filter((c) => c.length === termsToUse.length);
       const shortCombos = allCombos.filter((c) => c.length >= 2 && c.length <= 3 && c.length < termsToUse.length);
       const mediumCombos = allCombos.filter((c) => c.length > 3 && c.length < termsToUse.length);
-      const singles = allCombos.filter((c) => c.length === 1);
+      // Only allow single-term searches for non-filler words
+      const singles = allCombos.filter((c) => c.length === 1 && !FILLER_WORDS.has(c[0].toLowerCase()));
       const combos = [...fullLength, ...shortCombos, ...mediumCombos, ...singles];
 
       for (const combo of combos) {
@@ -490,8 +524,10 @@ server.tool(
       }
     }
 
-    // Return best weak match if we found anything
-    if (bestWeak) {
+    // If weak match has decent relevance, return it. Otherwise try the bridge first —
+    // the bridge may find better results via 510(k) device names.
+    const WEAK_RETURN_THRESHOLD = 0.3; // below this, prefer bridge over weak classification match
+    if (bestWeak && bestWeak.score >= WEAK_RETURN_THRESHOLD) {
       return { content: [{ type: "text" as const, text: formatClassificationResults(bestWeak.data, bestWeak.url) }] };
     }
 
@@ -501,6 +537,11 @@ server.tool(
     const bridgeResult = await bridgeVia510k(query!, originalTerms, expandedTerms, device_class, resultLimit);
     if (bridgeResult) {
       return { content: [{ type: "text" as const, text: bridgeResult }] };
+    }
+
+    // Fall back to weak classification match if bridge also failed
+    if (bestWeak) {
+      return { content: [{ type: "text" as const, text: formatClassificationResults(bestWeak.data, bestWeak.url) }] };
     }
 
     // Nothing found anywhere — give actionable suggestions
