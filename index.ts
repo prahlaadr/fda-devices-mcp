@@ -471,16 +471,166 @@ server.tool(
       return { content: [{ type: "text" as const, text: formatClassificationResults(bestWeak.data, bestWeak.url) }] };
     }
 
-    // Nothing found
+    // Pass 3: 510(k) bridge — search 510(k) device names, extract product codes, look up classifications
+    // Many AI/SaMD devices are classified under generic codes (e.g., MYN "Analyzer, Medical Image")
+    // but have specific names in 510(k) submissions. This bridges the gap.
+    const bridgeResult = await bridgeVia510k(query!, originalTerms, expandedTerms, device_class, resultLimit);
+    if (bridgeResult) {
+      return { content: [{ type: "text" as const, text: bridgeResult }] };
+    }
+
+    // Nothing found anywhere — give actionable suggestions
+    const suggestions: string[] = [];
+    const lowerQuery = query!.toLowerCase();
+
+    // Detect if query is about AI/SaMD (common miss category)
+    const aiTerms = ["ai", "ml", "algorithm", "machine learning", "deep learning", "artificial intelligence", "samd", "software"];
+    const isAIQuery = originalTerms.some((t) => aiTerms.includes(t.toLowerCase()));
+
+    if (isAIQuery) {
+      suggestions.push(
+        `Many AI/ML-enabled devices are classified under generic product codes:`,
+        `  - **QIH** — Automated Radiological Image Processing Software`,
+        `  - **QDQ** — Radiological Computer Assisted Detection/Diagnosis Software`,
+        `  - **MYN** — Analyzer, Medical Image`,
+        `  - **QBS** — Radiological CAD Software For Fracture`,
+        `  - **QNP** — Gastrointestinal Lesion Software Detection System`,
+        `  - **QJU** — Image Acquisition/Optimization Guided By AI`,
+        ``,
+        `Try: \`classify_device\` with one of these product codes, or \`search_510k\` with applicant/device_name to find specific cleared products.`,
+      );
+    } else {
+      suggestions.push(
+        `Suggestions:`,
+        `  - Try shorter or broader medical terms (FDA uses formal names like "Oximeter, Pulse" not "pulse oximeter")`,
+        `  - Use \`search_510k\` with \`device_name\` or \`applicant\` to find specific cleared devices`,
+        `  - If you know the company, search by applicant name in \`search_510k\``,
+      );
+    }
+
     const fallbackUrl = `${BASE_URL}/classification.json?search=${buildSearchTerms("device_name", query!)}&limit=1`;
     return {
       content: [{
         type: "text" as const,
-        text: `No classification results found for "${query}". Try shorter or broader medical terms. FDA uses formal names like "Oximeter, Pulse" not "pulse oximeter".\n\n${formatFooter(fallbackUrl)}`,
+        text: `No classification results found for "${query}".\n\n${suggestions.join("\n")}\n\n${formatFooter(fallbackUrl)}`,
       }],
     };
   }
 );
+
+// 510(k) bridge: when classification search fails, search 510(k) device names
+// to discover product codes, then look up those codes in classification.
+async function bridgeVia510k(
+  query: string,
+  originalTerms: string[],
+  expandedTerms: string[],
+  device_class: string | undefined,
+  resultLimit: number,
+): Promise<string | null> {
+  // Try both expanded and original terms against 510(k) device_name
+  const termSets = [expandedTerms, originalTerms];
+  const seen510k = new Set<string>();
+
+  // Generic terms that are too broad to search alone in 510(k) device names
+  const GENERIC_510K_TERMS = new Set([
+    "artificial", "intelligence", "machine", "learning", "software", "device",
+    "system", "detection", "screening", "diagnosis", "diagnostic", "analysis",
+    "monitor", "automated", "computer", "digital", "algorithm", "image",
+    "processing", "aided", "based", "clinical", "decision", "support",
+  ]);
+
+  for (const terms of termSets) {
+    // Separate medical-specific terms from generic ones for smarter combo generation
+    const medicalTerms = terms.filter((t) => !GENERIC_510K_TERMS.has(t.toLowerCase()));
+    const combos = generateCombinations(terms);
+    // Try combos from longest down to pairs, plus single medical terms
+    const pairAndUp = combos.filter((c) => c.length >= 2).slice(0, 8);
+    const medicalSingles = medicalTerms.map((t) => [t]);
+    const topCombos = [...pairAndUp, ...medicalSingles];
+
+    for (const combo of topCombos) {
+      const searchExpr = buildSearchTerms("device_name", combo.join(" "));
+      const key = combo.join("+");
+      if (seen510k.has(key)) continue;
+      seen510k.add(key);
+
+      const { data } = await queryOpenFDA("510k", [searchExpr], { limit: 20, sort: "decision_date:desc" });
+
+      if (!data.error && data.results && data.results.length > 0) {
+        // Extract unique product codes from 510(k) results
+        const productCodes = new Map<string, { code: string; deviceNames: string[]; count: number }>();
+        for (const r of data.results) {
+          const pc = (r.product_code as string)?.toUpperCase();
+          if (!pc || !PRODUCT_CODE_RE.test(pc)) continue;
+          const existing = productCodes.get(pc);
+          if (existing) {
+            existing.count++;
+            const name = r.device_name as string;
+            if (name && !existing.deviceNames.includes(name)) existing.deviceNames.push(name);
+          } else {
+            productCodes.set(pc, { code: pc, deviceNames: [r.device_name as string].filter(Boolean), count: 1 });
+          }
+        }
+
+        if (productCodes.size === 0) continue;
+
+        // Look up each unique product code in classification
+        const classificationResults: Record<string, unknown>[] = [];
+        const classUrls: string[] = [];
+        for (const [pc] of productCodes) {
+          const searchParts = [`product_code:${pc}`];
+          if (device_class) searchParts.push(`device_class:${device_class}`);
+          const { data: classData, url: classUrl } = await queryOpenFDA("classification", searchParts, { limit: 1 });
+          if (!classData.error && classData.results?.length) {
+            classificationResults.push(...classData.results);
+            classUrls.push(classUrl);
+          }
+        }
+
+        if (classificationResults.length === 0) continue;
+
+        // Build response showing classification + the 510(k) devices that led to it
+        const lines: string[] = [
+          `No direct classification match for "${query}". Found ${classificationResults.length} classification(s) via 510(k) device name search:\n`,
+        ];
+
+        for (const r of classificationResults) {
+          const pc = r.product_code as string;
+          const regNum = r.regulation_number as string;
+          const pcInfo = productCodes.get(pc);
+          lines.push(`**${pc}** — ${r.device_name}`);
+          lines.push(`  Class: ${r.device_class} | Regulation: ${regNum}`);
+          lines.push(`  Panel: ${r.medical_specialty} (${r.medical_specialty_description})`);
+          if (r.definition) lines.push(`  Definition: ${(r.definition as string).slice(0, 200)}${(r.definition as string).length > 200 ? "..." : ""}`);
+          lines.push(`  Implant: ${r.implant_flag} | Life-sustaining: ${r.life_sustain_support_flag} | GMP exempt: ${r.gmp_exempt_flag}`);
+          lines.push(`  Third-party eligible: ${r.third_party_flag} | Submission type: ${r.submission_type_id}`);
+          lines.push(`  FDA source: ${linkClassification(pc)}`);
+          if (regNum) lines.push(`  eCFR: ${linkECFR(regNum)}`);
+          if (pcInfo) {
+            lines.push(`  _Found via 510(k) devices: ${pcInfo.deviceNames.slice(0, 3).join("; ")}${pcInfo.deviceNames.length > 3 ? ` (+${pcInfo.deviceNames.length - 3} more)` : ""}_`);
+          }
+          lines.push("");
+        }
+
+        // Show a few example 510(k)s that matched
+        const exampleDevices = data.results.slice(0, 5);
+        lines.push(`**510(k) matches for "${query}"** (${data.meta?.results?.total ?? data.results.length} total):\n`);
+        for (const r of exampleDevices) {
+          const kn = r.k_number as string;
+          const decisionDate = normalizeDateResponse(r.decision_date as string);
+          lines.push(`- **${kn}** ${r.device_name} — ${r.applicant} (${decisionDate ?? "N/A"}) [${r.product_code}]`);
+        }
+        lines.push("");
+
+        const bridgeUrl = `${BASE_URL}/510k.json?search=${searchExpr}&limit=20&sort=decision_date:desc`;
+        lines.push(formatFooter(bridgeUrl, data.meta));
+        return lines.join("\n");
+      }
+    }
+  }
+
+  return null;
+}
 
 function formatClassificationResults(data: OpenFDAResponse, url: string): string {
   const total = data.meta?.results?.total ?? 0;
