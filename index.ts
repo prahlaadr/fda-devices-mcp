@@ -392,6 +392,12 @@ server.tool(
 
     const resultLimit = limit ?? 10;
 
+    // Auto-detect product code passed as query (e.g., query="QIH" instead of product_code="QIH")
+    if (!product_code && query && PRODUCT_CODE_RE.test(query.trim())) {
+      product_code = query.trim().toUpperCase();
+      query = undefined;
+    }
+
     // Direct product code lookup
     if (product_code) {
       const err = validateProductCode(product_code);
@@ -428,11 +434,29 @@ server.tool(
     let bestWeak: { data: OpenFDAResponse; url: string; score: number } | null = null;
     const RELEVANCE_THRESHOLD = 0.4; // at least 40% of original terms should be covered (directly or via synonyms)
 
-    const MAX_API_CALLS = 20; // Cap total API calls to avoid rate limits
+    // Filler words that add noise to FDA classification searches
+    const FILLER_WORDS = new Set([
+      "a", "an", "the", "for", "of", "in", "on", "to", "and", "or", "is", "it",
+      "what", "how", "which", "my", "with", "from", "that", "this",
+      "fda", "class", "device", "medical", "need", "does",
+    ]);
+
+    const MAX_API_CALLS = 30; // Cap total API calls to avoid rate limits
     let apiCalls = 0;
 
     for (const { terms } of termSets) {
-      const combos = generateCombinations(terms);
+      // Filter out filler words for combo generation
+      const meaningful = terms.filter((t) => !FILLER_WORDS.has(t.toLowerCase()) && t.length > 1);
+      const termsToUse = meaningful.length >= 2 ? meaningful : terms;
+
+      // Prioritize: full length first, then 2-3 term combos (sweet spot for FDA names),
+      // then longer combos. This ensures we reach specific medical pairs quickly.
+      const allCombos = generateCombinations(termsToUse);
+      const fullLength = allCombos.filter((c) => c.length === termsToUse.length);
+      const shortCombos = allCombos.filter((c) => c.length >= 2 && c.length <= 3 && c.length < termsToUse.length);
+      const mediumCombos = allCombos.filter((c) => c.length > 3 && c.length < termsToUse.length);
+      const singles = allCombos.filter((c) => c.length === 1);
+      const combos = [...fullLength, ...shortCombos, ...mediumCombos, ...singles];
 
       for (const combo of combos) {
         if (apiCalls >= MAX_API_CALLS) break;
@@ -453,7 +477,7 @@ server.tool(
             const score = scoreResults(data.results, originalTerms);
 
             // Full-length combo or strong relevance: return immediately
-            if (combo.length >= terms.length || score >= RELEVANCE_THRESHOLD) {
+            if (combo.length >= termsToUse.length || score >= RELEVANCE_THRESHOLD) {
               return { content: [{ type: "text" as const, text: formatClassificationResults(data, url) }] };
             }
 
@@ -543,9 +567,10 @@ async function bridgeVia510k(
     // Separate medical-specific terms from generic ones for smarter combo generation
     const medicalTerms = terms.filter((t) => !GENERIC_510K_TERMS.has(t.toLowerCase()));
     const combos = generateCombinations(terms);
-    // Try combos from longest down to pairs, plus single medical terms
+    // Try combos from longest down to pairs; only allow single-term searches for
+    // specific enough medical terms (>= 5 chars to avoid "low", "GI", etc.)
     const pairAndUp = combos.filter((c) => c.length >= 2).slice(0, 8);
-    const medicalSingles = medicalTerms.map((t) => [t]);
+    const medicalSingles = medicalTerms.filter((t) => t.length >= 5).map((t) => [t]);
     const topCombos = [...pairAndUp, ...medicalSingles];
 
     for (const combo of topCombos) {
