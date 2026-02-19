@@ -172,6 +172,170 @@ function buildSearchTerms(field: string, query: string): string {
   return terms.map((t) => `${field}:${t}`).join("+AND+");
 }
 
+// ─── Synonym Map ──────────────────────────────────────────────────────────────
+// Maps common user terms → FDA formal terminology. Keys must be lowercase.
+const SYNONYMS: Record<string, string[]> = {
+  ecg: ["electrocardiograph"],
+  ekg: ["electrocardiograph"],
+  robot: ["computer controlled instrument"],
+  robotic: ["computer controlled instrument"],
+  bp: ["blood pressure"],
+  cgm: ["continuous glucose monitor"],
+  ai: ["artificial intelligence"],
+  mri: ["magnetic resonance imaging"],
+  ct: ["computed tomography"],
+  xray: ["x-ray"],
+  "x-ray": ["radiographic"],
+  ultrasound: ["ultrasonic"],
+  cpap: ["continuous positive airway pressure"],
+  tens: ["transcutaneous electrical nerve stimulation"],
+  iud: ["intrauterine"],
+  stent: ["endoprosthesis"],
+  pacemaker: ["pulse generator"],
+  defibrillator: ["defibrillator"],
+  ventilator: ["ventilator"],
+  catheter: ["catheter"],
+  laser: ["laser"],
+  pump: ["infusion pump"],
+  thermometer: ["thermometer"],
+  oximeter: ["oximeter"],
+  hearing: ["hearing aid"],
+  insulin: ["insulin"],
+  dialysis: ["hemodialysis"],
+  prosthetic: ["prosthesis"],
+  implant: ["implant"],
+  endoscope: ["endoscope"],
+  monitor: ["monitor"],
+  wearable: ["wearable"],
+  patch: ["ambulatory"],
+  portable: ["portable"],
+  wireless: ["wireless"],
+  bluetooth: ["wireless"],
+  home: ["home use"],
+  otc: ["over-the-counter"],
+  samd: ["software"],
+  "software device": ["software"],
+  app: ["software", "mobile"],
+  cad: ["computer aided detection"],
+  "cad-x": ["computer aided diagnosis"],
+  triage: ["triage"],
+  diagnostic: ["diagnostic"],
+  screening: ["screening"],
+  imaging: ["image processing"],
+  ehr: ["electronic health record"],
+  clinical: ["clinical decision support"],
+  cds: ["clinical decision support"],
+  ml: ["machine learning"],
+  "deep learning": ["machine learning"],
+  algorithm: ["algorithm"],
+  waveform: ["electrocardiograph"],
+  "heart monitor": ["electrocardiograph"],
+  "heart rate": ["heart rate"],
+  "blood sugar": ["glucose"],
+  glucometer: ["glucose meter"],
+  spo2: ["oximeter"],
+  "sleep apnea": ["apnea"],
+};
+
+// Expand user query terms using synonym map. Returns deduplicated expanded terms array.
+function expandSynonyms(terms: string[]): string[] {
+  const expanded: string[] = [];
+  const seen = new Set<string>();
+  for (const term of terms) {
+    const key = term.toLowerCase();
+    if (SYNONYMS[key]) {
+      for (const syn of SYNONYMS[key]) {
+        for (const word of syn.split(/\s+/)) {
+          const lower = word.toLowerCase();
+          if (!seen.has(lower)) {
+            seen.add(lower);
+            expanded.push(word);
+          }
+        }
+      }
+    } else {
+      if (!seen.has(key)) {
+        seen.add(key);
+        expanded.push(term);
+      }
+    }
+  }
+  return expanded;
+}
+
+// Generate term combinations ordered by length (longest first), then left-to-right.
+// For [A, B, C] → [[A,B,C], [A,B], [B,C], [A,C], [A], [B], [C]]
+function generateCombinations(terms: string[]): string[][] {
+  if (terms.length <= 1) return [terms];
+
+  const combos: string[][] = [];
+  // Group by size, largest first
+  for (let size = terms.length; size >= 1; size--) {
+    // Generate all contiguous and non-contiguous combos of this size
+    const indices = getCombinationIndices(terms.length, size);
+    for (const idx of indices) {
+      combos.push(idx.map((i) => terms[i]));
+    }
+  }
+  return combos;
+}
+
+// Get all index combinations of `size` from `n` items, preferring contiguous runs
+function getCombinationIndices(n: number, size: number): number[][] {
+  const contiguous: number[][] = [];
+  const nonContiguous: number[][] = [];
+
+  function* combine(start: number, picked: number[]): Generator<number[]> {
+    if (picked.length === size) { yield [...picked]; return; }
+    for (let i = start; i < n; i++) {
+      picked.push(i);
+      yield* combine(i + 1, picked);
+      picked.pop();
+    }
+  }
+
+  for (const combo of combine(0, [])) {
+    // Check if contiguous
+    let isContiguous = true;
+    for (let i = 1; i < combo.length; i++) {
+      if (combo[i] !== combo[i - 1] + 1) { isContiguous = false; break; }
+    }
+    if (isContiguous) contiguous.push(combo);
+    else nonContiguous.push(combo);
+  }
+
+  return [...contiguous, ...nonContiguous];
+}
+
+// Score how relevant results are to the original query terms.
+// Returns 0-1 where 1 = all original terms "covered" in device names/definitions.
+// A term is "covered" if either the term itself or any of its synonym expansions appear.
+function scoreResults(results: Record<string, unknown>[], originalTerms: string[]): number {
+  if (!results.length || !originalTerms.length) return 0;
+
+  // Build a coverage map: for each original term, what strings count as a match?
+  const coverageMap: { original: string; matchStrings: string[] }[] = originalTerms.map((t) => {
+    const lower = t.toLowerCase();
+    const expansions = SYNONYMS[lower]
+      ? SYNONYMS[lower].flatMap((s) => s.toLowerCase().split(/\s+/))
+      : [];
+    return { original: lower, matchStrings: [lower, ...expansions] };
+  });
+
+  let totalScore = 0;
+  for (const r of results) {
+    const name = ((r.device_name as string) ?? "").toLowerCase();
+    const def = ((r.definition as string) ?? "").toLowerCase();
+    const text = `${name} ${def}`;
+    let covered = 0;
+    for (const { matchStrings } of coverageMap) {
+      if (matchStrings.some((s) => text.includes(s))) covered++;
+    }
+    totalScore += covered / coverageMap.length;
+  }
+  return totalScore / results.length;
+}
+
 function formatFooter(url: string, meta?: OpenFDAResponse["meta"]): string {
   const lastUpdated = meta?.last_updated ?? "unknown";
   return [
@@ -234,45 +398,61 @@ server.tool(
       return { content: [{ type: "text" as const, text: formatClassificationResults(data, url) }] };
     }
 
-    // Multi-pass query search
-    const terms = query!.trim().split(/\s+/);
+    // Multi-pass query search with synonym expansion and combinatorial broadening
+    const originalTerms = query!.trim().split(/\s+/);
+    const expandedTerms = expandSynonyms(originalTerms);
+    const hasExpansion = expandedTerms.join(" ") !== originalTerms.join(" ");
 
-    // Pass 1: device_name with all terms (AND), broadening by dropping last term
-    let currentTerms = [...terms];
-    while (currentTerms.length > 0) {
-      const searchParts = [buildSearchTerms("device_name", currentTerms.join(" "))];
-      if (device_class) searchParts.push(`device_class:${device_class}`);
+    // Build candidate term lists: expanded first (if different), then original
+    const termSets: { terms: string[]; label: string }[] = [];
+    if (hasExpansion) termSets.push({ terms: expandedTerms, label: "expanded" });
+    termSets.push({ terms: originalTerms, label: "original" });
 
-      const { data, url } = await queryOpenFDA("classification", searchParts, { limit: resultLimit });
+    // Track best weak result in case no strong match is found
+    let bestWeak: { data: OpenFDAResponse; url: string; score: number } | null = null;
+    const RELEVANCE_THRESHOLD = 0.4; // at least 40% of original terms should be covered (directly or via synonyms)
 
-      if (!data.error && data.results && data.results.length > 0) {
-        return { content: [{ type: "text" as const, text: formatClassificationResults(data, url) }] };
-      }
+    const MAX_API_CALLS = 20; // Cap total API calls to avoid rate limits
+    let apiCalls = 0;
 
-      if (currentTerms.length > 1) {
-        currentTerms.pop();
-      } else {
-        break;
+    for (const { terms } of termSets) {
+      const combos = generateCombinations(terms);
+
+      for (const combo of combos) {
+        if (apiCalls >= MAX_API_CALLS) break;
+
+        // For each combination, try both device_name and definition
+        const fields = ["device_name", "definition"] as const;
+
+        for (const field of fields) {
+          if (apiCalls >= MAX_API_CALLS) break;
+          apiCalls++;
+
+          const searchParts = [buildSearchTerms(field, combo.join(" "))];
+          if (device_class) searchParts.push(`device_class:${device_class}`);
+
+          const { data, url } = await queryOpenFDA("classification", searchParts, { limit: resultLimit });
+
+          if (!data.error && data.results && data.results.length > 0) {
+            const score = scoreResults(data.results, originalTerms);
+
+            // Full-length combo or strong relevance: return immediately
+            if (combo.length >= terms.length || score >= RELEVANCE_THRESHOLD) {
+              return { content: [{ type: "text" as const, text: formatClassificationResults(data, url) }] };
+            }
+
+            // Weak match: save if it's the best so far
+            if (!bestWeak || score > bestWeak.score) {
+              bestWeak = { data, url, score };
+            }
+          }
+        }
       }
     }
 
-    // Pass 2: definition field with all original terms, broadening
-    currentTerms = [...terms];
-    while (currentTerms.length > 0) {
-      const searchParts = [buildSearchTerms("definition", currentTerms.join(" "))];
-      if (device_class) searchParts.push(`device_class:${device_class}`);
-
-      const { data, url } = await queryOpenFDA("classification", searchParts, { limit: resultLimit });
-
-      if (!data.error && data.results && data.results.length > 0) {
-        return { content: [{ type: "text" as const, text: formatClassificationResults(data, url) }] };
-      }
-
-      if (currentTerms.length > 1) {
-        currentTerms.pop();
-      } else {
-        break;
-      }
+    // Return best weak match if we found anything
+    if (bestWeak) {
+      return { content: [{ type: "text" as const, text: formatClassificationResults(bestWeak.data, bestWeak.url) }] };
     }
 
     // Nothing found
